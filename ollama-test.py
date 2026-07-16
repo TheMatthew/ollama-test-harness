@@ -18,22 +18,71 @@ OLLAMA_HOST = os.environ.get(
 )  # default Ollama REST API port
 # GPU telemetry server runs on the same host as Ollama, different port
 GPU_SERVER = OLLAMA_HOST.rsplit(":", 1)[0] + ":28123"
-PROMPT = (
-    "Write a simple, self-contained C program (under 40 lines of code) that implements a "
-    "1D Cellular Automaton using Rule 90 to generate a fractal pattern in the terminal.\n\n"
-    "The program should meet the following requirements:\n"
-    "* Use a fixed-width array of 64 cells and run for 32 generations.\n"
-    "* Start the simulation with a single active cell (represented by `1`) exactly in the middle of the array, with all other cells set to `0`.\n"
-    "* In each generation, print the array to the terminal using `#` for active cells and a space for inactive cells.\n"
-    "* Compute the next state of each cell using the bitwise XOR operator (`^`) on its left and right neighbors from the current generation.\n"
-    "* Use a secondary buffer array to safely calculate the next generation before updating the main array.\n\n"
-    "Avoid using complex if/else branching for the cell logic, keeping the code clean, efficient, and readable. "
-    "Provide the source code wrapped cleanly inside a single ```c ... ``` block."
-)
+
+# Default task config: everything task-specific (prompt, build/run commands,
+# validation rules) lives outside this file — see tasks/rule90/rule90_c.json and
+# tasks/rule90/rule90_c.prompt.md. Point --task at a different config to benchmark
+# a completely different language/problem without touching this script.
+DEFAULT_TASK_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks", "rule90_c.json")
 
 OUTPUT_JSON = "ollama_benchmark_results.json"
 TRACE_JSON = "ollama_benchmark_trace.json"
 OUTPUT_BASE = "output"
+
+
+def load_task(path):
+    """Load a task config: prompt text, build/run command templates, and
+    declarative validation rules. This is what makes the harness generic —
+    swap --task to point at a different config to benchmark a different
+    language or problem; nothing in this file is Rule-90/C-specific once a
+    task is loaded.
+
+    Config schema (JSON):
+      name            str    short id, used in filenames
+      language        str    e.g. "c", "python" — used in the system prompt,
+                              the code-fence tag to look for, and {language}
+                              substitution in system_prompt
+      file_extension  str    extension for saved source files, e.g. "c"
+      prompt_file     str    path (relative to this config) to the prompt
+                              text; use "prompt" instead for an inline string
+      system_prompt   str    optional, "{language}" is substituted in
+      build_command   list   argv template with {src}/{bin} placeholders;
+                              omit or set null to skip compilation entirely
+                              (e.g. for interpreted languages)
+      run_command     list   argv template with {src}/{bin} placeholders
+      validation      list   declarative rules, see run_validation_rules()
+    """
+    task_dir = os.path.dirname(os.path.abspath(path))
+    with open(path, "r", encoding="utf-8") as f:
+        task = json.load(f)
+
+    if "prompt" not in task:
+        prompt_file = task.get("prompt_file")
+        if not prompt_file:
+            raise ValueError(f"Task config {path} must set either 'prompt' or 'prompt_file'.")
+        prompt_path = prompt_file if os.path.isabs(prompt_file) else os.path.join(task_dir, prompt_file)
+        with open(prompt_path, "r", encoding="utf-8") as f:
+            task["prompt"] = f.read()
+
+    task.setdefault("name", os.path.splitext(os.path.basename(path))[0])
+    task.setdefault("language", "code")
+    task.setdefault("file_extension", "txt")
+    task.setdefault("build_command", None)
+    task.setdefault("run_command", None)
+    task.setdefault("validation", [])
+    task.setdefault(
+        "system_prompt",
+        "You are a careful {language} programmer. Respond only with the requested "
+        "code, wrapped in a single ```{language} ... ``` block, and no explanation "
+        "outside the code block.",
+    )
+    task["system_prompt"] = task["system_prompt"].format(language=task["language"])
+    return task
+
+
+def render_command(template, **kwargs):
+    """Fill {src}/{bin} placeholders in a build_command/run_command template."""
+    return [tok.format(**kwargs) for tok in template]
 
 
 def model_output_dir(model_name: str) -> str:
@@ -213,24 +262,35 @@ def poll_gpu_server(interval, samples, stop_event, gpu_samples_out):
 # ---------------------------------------------------------------------------
 
 
-def extract_c_code(response_text):
-    """Extracts C code from the first Markdown code block found."""
-    match = re.search(r"```c\s*(.*?)\s*```", response_text, re.DOTALL | re.IGNORECASE)
+def extract_code_block(response_text, language):
+    """Extract code from the first fenced Markdown block.
+
+    Prefers a block tagged with the task's language (```c, ```python, ...)
+    and falls back to any fenced block if that tag isn't present.
+    """
+    pattern = r"```" + re.escape(language) + r"\s*(.*?)\s*```"
+    match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
     if match:
         return match.group(1)
-    match = re.search(r"```\s*(.*?)\s*```", response_text, re.DOTALL)
+    match = re.search(r"```\w*\s*(.*?)\s*```", response_text, re.DOTALL)
     if match:
         return match.group(1)
     return None
 
 
-def validate_output(program_output):
-    """Validate program output against every Rule-90 requirement.
+def run_validation_rules(program_output, rules):
+    """Generic, declarative output validator.
 
-    Unlike a short-circuiting check, this runs *all* checks and returns
-    every failure at once, each with the specific line/index/value involved,
-    so a human or the LLM gets complete, actionable feedback in a single
-    pass instead of a back-and-forth discovering one problem per retry.
+    Every rule runs — not just until the first failure — and each failure
+    message includes the specific line/index/value involved, the same
+    level of detail as a hand-written checker. Adding a new task only
+    requires new rules in a task config, not new Python here.
+
+    Supported rule types:
+      line_count     {expected}
+      line_width     {width}
+      single_char_at {line, index, char, label?}
+      symmetric_pair {line, indices: [..], char, label?}
 
     Returns:
         (passed: bool, errors: list[str], notes: str)
@@ -238,63 +298,58 @@ def validate_output(program_output):
     errors = []
     lines = [line for line in program_output.splitlines() if line.strip()]
 
-    # ---- generation count ----
-    if len(lines) != 32:
-        errors.append(f"Expected 32 generations (non-blank lines), got {len(lines)}.")
+    for rule in rules:
+        rtype = rule.get("type")
 
-    # ---- line width: report every offending line individually ----
-    for i, line in enumerate(lines):
-        if len(line) != 64:
-            errors.append(
-                f"Generation {i} (output line {i + 1}) is {len(line)} characters wide, expected 64."
-            )
+        if rtype == "line_count":
+            expected = rule["expected"]
+            if len(lines) != expected:
+                errors.append(f"Expected {expected} non-blank output lines, got {len(lines)}.")
 
-    # ---- generation 0: exactly one '#', centered at index 32 ----
-    if len(lines) >= 1:
-        gen0 = lines[0]
-        count0 = gen0.count("#")
-        if count0 != 1:
-            errors.append(
-                f"Generation 0 has {count0} '#' character(s), expected exactly 1."
-            )
-        elif len(gen0) <= 32:
-            errors.append(
-                f"Generation 0 is only {len(gen0)} characters wide, too short to check for '#' at center index 32."
-            )
-        elif gen0[32] != "#":
-            errors.append(
-                f"Generation 0's single '#' is at index {gen0.index('#')}, expected index 32 (center)."
-            )
-    else:
-        errors.append("No generation 0 to check: program produced no output lines.")
+        elif rtype == "line_width":
+            width = rule["width"]
+            for i, line in enumerate(lines):
+                if len(line) != width:
+                    errors.append(f"Line {i} (output line {i + 1}) is {len(line)} characters wide, expected {width}.")
 
-    # ---- generation 1: symmetric XOR spawn at indices 31 and 33 ----
-    if len(lines) >= 2:
-        gen1 = lines[1]
-        count1 = gen1.count("#")
-        if count1 != 2:
-            errors.append(
-                f"Generation 1 has {count1} '#' character(s), expected exactly 2."
-            )
-        elif len(gen1) <= 33:
-            errors.append(
-                f"Generation 1 is only {len(gen1)} characters wide, too short to check indices 31 and 33."
-            )
+        elif rtype == "single_char_at":
+            line_no = rule["line"]
+            idx = rule["index"]
+            char = rule["char"]
+            label = rule.get("label", f"Line {line_no}")
+            if len(lines) <= line_no:
+                errors.append(f"No {label.lower()} to check: output has fewer than {line_no + 1} line(s).")
+                continue
+            target = lines[line_no]
+            count = target.count(char)
+            if count != 1:
+                errors.append(f"{label} has {count} '{char}' character(s), expected exactly 1.")
+            elif len(target) <= idx:
+                errors.append(f"{label} is only {len(target)} characters wide, too short to check for '{char}' at index {idx}.")
+            elif target[idx] != char:
+                errors.append(f"{label}'s single '{char}' is at index {target.index(char)}, expected index {idx}.")
+
+        elif rtype == "symmetric_pair":
+            line_no = rule["line"]
+            indices = rule["indices"]
+            char = rule["char"]
+            label = rule.get("label", f"Line {line_no}")
+            if len(lines) <= line_no:
+                errors.append(f"No {label.lower()} to check: output has fewer than {line_no + 1} line(s).")
+                continue
+            target = lines[line_no]
+            count = target.count(char)
+            if count != len(indices):
+                errors.append(f"{label} has {count} '{char}' character(s), expected exactly {len(indices)}.")
+            elif len(target) <= max(indices):
+                errors.append(f"{label} is only {len(target)} characters wide, too short to check indices {indices}.")
+            else:
+                for idx in indices:
+                    if target[idx] != char:
+                        errors.append(f"{label} index {idx} is '{target[idx]}', expected '{char}'.")
+
         else:
-            left_ok = gen1[31] == "#"
-            right_ok = gen1[33] == "#"
-            if not left_ok:
-                errors.append(
-                    f"Generation 1 index 31 is '{gen1[31]}', expected '#' (left child of center)."
-                )
-            if not right_ok:
-                errors.append(
-                    f"Generation 1 index 33 is '{gen1[33]}', expected '#' (right child of center)."
-                )
-    else:
-        errors.append(
-            "No generation 1 to check: program produced fewer than 2 output lines."
-        )
+            errors.append(f"Unknown validation rule type '{rtype}' in task config — skipped.")
 
     passed = not errors
     notes = (
@@ -310,12 +365,16 @@ def validate_output(program_output):
 # ---------------------------------------------------------------------------
 
 
-def evaluate_model(model_name, event_log, previous_model=None):
+def evaluate_model(model_name, event_log, task, previous_model=None):
     """Processes generation, compilation, and testing workflows for a target model.
 
     *event_log* is a single EventLog instance shared across the whole program
     run (see main()) — hardware telemetry, inference/fix-request spans, and
     compile/run spans for every model all land in the same thread-safe log.
+
+    *task* is a loaded task config (see load_task()) supplying the prompt,
+    build/run command templates, and validation rules — nothing below is
+    specific to any one language or problem.
     """
     metrics = {
         "model": model_name,
@@ -344,15 +403,8 @@ def evaluate_model(model_name, event_log, previous_model=None):
 
     # Chat transcript, built up turn by turn and saved to out_dir after each turn.
     messages = [
-        {
-            "role": "system",
-            "content": (
-                "You are a careful C programmer. Respond only with the requested "
-                "code, wrapped in a single ```c ... ``` block, and no explanation "
-                "outside the code block."
-            ),
-        },
-        {"role": "user", "content": PROMPT},
+        {"role": "system", "content": task["system_prompt"]},
+        {"role": "user", "content": task["prompt"]},
     ]
     metrics["chat_history_file"] = save_chat_history(out_dir, messages)
 
@@ -490,11 +542,11 @@ def evaluate_model(model_name, event_log, previous_model=None):
         messages.append({"role": "assistant", "content": raw_content})
         metrics["chat_history_file"] = save_chat_history(out_dir, messages)
 
-        c_code = extract_c_code(raw_content)
+        c_code = extract_code_block(raw_content, task["language"])
 
         if not c_code:
             metrics["compiler_errors"] = (
-                "Failed to extract valid C source block from LLM response."
+                "Failed to extract a valid code block from LLM response."
             )
             return metrics
 
@@ -512,10 +564,12 @@ def evaluate_model(model_name, event_log, previous_model=None):
             # On attempts > 1 ask the LLM to fix the previous error
             if attempt > 1:
                 fix_prompt = (
-                    f"The C code you provided failed to compile or produced incorrect output.\n\n"
+                    f"The {task['language']} code you provided failed to compile/run or "
+                    f"produced incorrect output.\n\n"
                     f"Error (attempt {attempt - 1}):\n{last_error}\n\n"
                     f"Please fix the code and return the corrected version wrapped in a single "
-                    f"```c ... ``` block. Do not include any explanation outside the code block."
+                    f"```{task['language']} ... ``` block. Do not include any explanation outside "
+                    f"the code block."
                 )
                 print(
                     f"      -> [Attempt {attempt}/{MAX_COMPILE_ATTEMPTS}] Sending fix request to LLM..."
@@ -544,16 +598,16 @@ def evaluate_model(model_name, event_log, previous_model=None):
                     metrics["time_taken_sec"] += (
                         (extra_ns / 1_000_000_000.0) if extra_ns > 0 else 0
                     )
-                    c_code = extract_c_code(raw_content)
+                    c_code = extract_code_block(raw_content, task["language"])
                     if not c_code:
                         last_error = (
-                            "Failed to extract valid C source block from LLM response."
+                            "Failed to extract a valid code block from LLM response."
                         )
                         metrics["iteration_history"].append(
                             {"attempt": attempt, "error": last_error, "c_code": None}
                         )
                         print(
-                            f"      -> [Attempt {attempt}] No C block extracted from LLM response."
+                            f"      -> [Attempt {attempt}] No code block extracted from LLM response."
                         )
                         continue
                 except Exception as e:
@@ -569,52 +623,57 @@ def evaluate_model(model_name, event_log, previous_model=None):
 
             # File names include attempt number so every iteration is preserved
             suffix = f"_iter{attempt}" if attempt > 1 else ""
-            src_file = os.path.join(out_dir, f"verify_rule90{suffix}.c")
-            bin_file = os.path.join(out_dir, f"verify_rule90{suffix}")
+            src_file = os.path.join(out_dir, f"{task['name']}{suffix}.{task['file_extension']}")
+            bin_file = os.path.join(out_dir, f"{task['name']}{suffix}")
 
-            # Write C source
+            # Write source
             with open(src_file, "w") as f:
                 f.write(c_code)
-            print(f"      -> [Attempt {attempt}] C source saved: {src_file}")
+            print(f"      -> [Attempt {attempt}] Source saved: {src_file}")
 
-            # Compile (timed + traced)
-            event_log.span_begin("Compile", model_name, attempt=attempt)
-            compile_start = time.monotonic()
-            compile_res = subprocess.run(
-                ["gcc", "-Wall", "-Wextra", src_file, "-o", bin_file],
-                capture_output=True,
-                text=True,
-            )
-            compile_dur_sec = round(time.monotonic() - compile_start, 3)
-            event_log.span_end(
-                "Compile",
-                model_name,
-                attempt=attempt,
-                returncode=compile_res.returncode,
-                duration_sec=compile_dur_sec,
-            )
-            metrics["compile_durations_sec"].append(compile_dur_sec)
-            metrics["total_compile_time_sec"] += compile_dur_sec
-            print(f"      -> [Attempt {attempt}] Compile took {compile_dur_sec:.3f}s")
-
-            if compile_res.returncode != 0:
-                last_error = compile_res.stderr.strip()
-                metrics["iteration_history"].append(
-                    {"attempt": attempt, "error": last_error, "c_code": c_code}
+            # Compile (timed + traced) — skipped entirely for tasks with no
+            # build_command (e.g. interpreted languages).
+            if task["build_command"]:
+                event_log.span_begin("Compile", model_name, attempt=attempt)
+                compile_start = time.monotonic()
+                compile_res = subprocess.run(
+                    render_command(task["build_command"], src=src_file, bin=bin_file),
+                    capture_output=True,
+                    text=True,
                 )
-                print(f"      -> [Attempt {attempt}] Compilation FAILED:\n{last_error}")
-                continue  # retry
+                compile_dur_sec = round(time.monotonic() - compile_start, 3)
+                event_log.span_end(
+                    "Compile",
+                    model_name,
+                    attempt=attempt,
+                    returncode=compile_res.returncode,
+                    duration_sec=compile_dur_sec,
+                )
+                metrics["compile_durations_sec"].append(compile_dur_sec)
+                metrics["total_compile_time_sec"] += compile_dur_sec
+                print(f"      -> [Attempt {attempt}] Compile took {compile_dur_sec:.3f}s")
 
-            if compile_res.stderr:
-                metrics["compiler_warnings"] = compile_res.stderr
+                if compile_res.returncode != 0:
+                    last_error = compile_res.stderr.strip()
+                    metrics["iteration_history"].append(
+                        {"attempt": attempt, "error": last_error, "c_code": c_code}
+                    )
+                    print(f"      -> [Attempt {attempt}] Compilation FAILED:\n{last_error}")
+                    continue  # retry
 
-            print(f"      -> [Attempt {attempt}] Binary saved: {bin_file}")
+                if compile_res.stderr:
+                    metrics["compiler_warnings"] = compile_res.stderr
+
+                print(f"      -> [Attempt {attempt}] Binary saved: {bin_file}")
+            else:
+                metrics["compile_durations_sec"].append(0.0)
 
             # Run (timed + traced)
+            run_cmd = render_command(task["run_command"], src=src_file, bin=bin_file)
             event_log.span_begin("Run", model_name, attempt=attempt)
             try:
                 run_res = subprocess.run(
-                    [bin_file], capture_output=True, text=True, timeout=5, check=True
+                    run_cmd, capture_output=True, text=True, timeout=5, check=True
                 )
                 program_output = run_res.stdout
                 event_log.span_end("Run", model_name, attempt=attempt, returncode=0)
@@ -648,8 +707,8 @@ def evaluate_model(model_name, event_log, previous_model=None):
 
             # Validate output — every check runs (not just the first
             # failure), so feedback to the LLM is complete and specific.
-            passed, validation_errors, validation_notes = validate_output(
-                program_output
+            passed, validation_errors, validation_notes = run_validation_rules(
+                program_output, task["validation"]
             )
 
             if not passed:
@@ -1054,7 +1113,16 @@ def export_chrome_trace(results: list, output_path: str, event_log: "EventLog"):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Benchmark local Ollama models on a Rule-90 coding task."
+        description="Benchmark local Ollama models against a coding task defined by a task config."
+    )
+    parser.add_argument(
+        "--task",
+        metavar="FILE",
+        default=DEFAULT_TASK_PATH,
+        help=(
+            "Path to a task config JSON (prompt, build/run commands, validation "
+            f"rules). Default: {DEFAULT_TASK_PATH}"
+        ),
     )
     parser.add_argument(
         "--chrome-trace",
@@ -1082,123 +1150,174 @@ def main():
     )
     args = parser.parse_args()
 
-    print(f"Connecting to Ollama host at {OLLAMA_HOST}...")
-    try:
-        response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
-        response.raise_for_status()
-        tags_data = response.json()
-        models = [m["name"] for m in tags_data.get("models", [])]
+    # If --task is the default and is not explicitly provided, or if user wants to select dynamically,
+    # let's scan the tasks folder.
+    task_path = None
+    if args.task == DEFAULT_TASK_PATH:
+        # Scan 'tasks' directory for subfolders containing .json configs
+        tasks_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tasks")
+        subfolders = []
+        if os.path.exists(tasks_dir):
+            for name in sorted(os.listdir(tasks_dir)):
+                d = os.path.join(tasks_dir, name)
+                if os.path.isdir(d):
+                    # Look for JSON files in this directory
+                    jsons = [f for f in os.listdir(d) if f.endswith(".json")]
+                    if jsons:
+                        subfolders.append((name, d, jsons))
 
-        def extract_params(model_string):
-            # Searches for one or more digits followed by 'b'
-            match = re.search(r"(\d+)b", model_string)
-            return int(match.group(1)) if match else 0
-
-        models.sort(key=extract_params)
-    except Exception as e:
-        print(f"Could not fetch models from Ollama instance: {e}")
-        return
-
-    if not models:
-        print("No local models found in your Ollama deployment.")
-        return
-
-    print(f"Found {len(models)} model(s) to benchmark. Initiating pipeline...\n")
-
-    # One EventLog + one telemetry thread for the *entire* program run,
-    # started before the first model and stopped after the last. This is
-    # what removes the drift: temperature/power are one continuous stream
-    # instead of being torn down and re-seeded for every model.
-    event_log = EventLog()
-    telemetry_stop_event = threading.Event()
-    telemetry_thread = threading.Thread(
-        target=telemetry_worker,
-        args=(args.telemetry_interval, telemetry_stop_event, event_log),
-        daemon=True,
-        name="TelemetryWorker",
-    )
-    telemetry_thread.start()
-    print(
-        f"Hardware telemetry thread started (sampling every {args.telemetry_interval}s for the whole run).\n"
-    )
-
-    results = []
-    previous_model = None  # Initialize previous model tracker
-    cooldown_open = (
-        False  # tracks whether a cooldown span is currently open in event_log
-    )
-    #    models = [model for model in models if '128k' not in model]
-    total = len(models)
-    print("Evaluating models: " + ", ".join(models) + "\n")
-    try:
-        for n, model in enumerate(models, 1):
-            print(f"[{n}/{total}] Running benchmark on: {model}...")
-            # Unload the previous model before loading the next one, so GPU
-            # memory/power from one run doesn't bleed into the next model's
-            # numbers. (Previously this call existed but lived inside the
-            # trace-export function, so it never actually ran during the
-            # benchmark itself unless --chrome-trace happened to be passed
-            # — moved here to where it's actually needed.)
-            if previous_model is not None:
+        if not subfolders:
+            print(f"No task folders with JSON configs found in {tasks_dir}. Falling back to default.")
+            task_path = DEFAULT_TASK_PATH
+        else:
+            print("Select a task folder to run:")
+            all_configs = []
+            idx = 1
+            for name, d, jsons in subfolders:
+                for json_file in sorted(jsons):
+                    config_path = os.path.join(d, json_file)
+                    all_configs.append(config_path)
+                    print(f"  ({idx}) {name} - {json_file}")
+                    idx += 1
+            print(f"  (a) all")
+            
+            choice = input(f"Which test to run? (1-{len(all_configs)}, a/all): ").strip().lower()
+            if choice in ("a", "all"):
+                # We can run all or select all. If the user wants to run all, we might want to handle it.
+                # But evaluate_model/main in ollama-test.py runs models for a single task.
+                # Let's support running a single selected config path, or if 'all' is selected,
+                # we can modify main to run them in sequence, or just select all.
+                # Let's see: the user request says: say "which test to run, (1) rule90, (n) all... etc."
+                # If we select multiple/all, we need a list of task paths to run.
+                task_paths = all_configs
+            else:
                 try:
-                    print(f"      -> Unloading previous model: {previous_model}")
-                    subprocess.run(
-                        ["ollama", "delete", previous_model],
-                        check=False,
-                        capture_output=True,
-                    )
-                except Exception as e:
-                    print(
-                        f"      [WARN] Could not unload previous model '{previous_model}': {e}"
-                    )
-                # The GPU has been idle since the previous model's work
-                # finished; that cooldown period ends now, as this model's
-                # work is about to start.
-                if cooldown_open:
-                    event_log.cooldown_end(to_model=model)
-                    cooldown_open = False
+                    choice_idx = int(choice) - 1
+                    if 0 <= choice_idx < len(all_configs):
+                        task_paths = [all_configs[choice_idx]]
+                    else:
+                        print("Invalid choice, defaulting to first option.")
+                        task_paths = [all_configs[0]]
+                except ValueError:
+                    print("Invalid input, defaulting to first option.")
+                    task_paths = [all_configs[0]]
+    else:
+        task_paths = [args.task]
 
-            res = evaluate_model(model, event_log, previous_model)
-            results.append(res)
+    # For each task, perform the evaluation. If multiple tasks are selected, we run them sequentially.
+    for current_task_path in task_paths:
+        try:
+            task = load_task(current_task_path)
+        except Exception as e:
+            print(f"Could not load task config '{current_task_path}': {e}")
+            continue
+        print(f"\nRunning Task: {task['name']} ({task['language']})")
 
-            # This model's work (inference + all compile/run attempts) is
-            # done — the GPU is idle until the next model starts, so open a
-            # cooldown span to trace it.
-            event_log.cooldown_begin(from_model=model)
-            cooldown_open = True
+        print(f"Connecting to Ollama host at {OLLAMA_HOST}...")
+        try:
+            response = requests.get(f"{OLLAMA_HOST}/api/tags", timeout=5)
+            response.raise_for_status()
+            tags_data = response.json()
+            models = [m["name"] for m in tags_data.get("models", [])]
 
-            previous_model = model  # Update state for the next iteration
-            try:
-                with open(args.output, "w", encoding="utf-8") as json_file:
-                    json.dump(results, json_file, indent=4)
-            except Exception as e:
-                print(f"Failed to write results to JSON file: {e}")
-    finally:
-        # Close out any still-open cooldown (the last model's post-run idle
-        # period, ending at program exit rather than at a "next model").
-        if cooldown_open:
-            event_log.cooldown_end(to_model=None)
-        # Always stop the telemetry thread cleanly, even on error/Ctrl-C,
-        # so the process can exit and the trace has a well-defined end.
-        telemetry_stop_event.set()
-        telemetry_thread.join(timeout=10)
+            def extract_params(model_string):
+                match = re.search(r"(\d+)b", model_string)
+                return int(match.group(1)) if match else 0
 
-    print("\n" + "=" * 100)
-    print(
-        f"{'MODEL':<25} | {'STATUS':<14} | {'TRIES':<5} | {'TOKENS':<8} | {'TIME (s)':<8} | {'TOK/s':<8} | {'COMPILE (s)':<11}"
-    )
-    print("=" * 100)
-    for r in results:
-        print(
-            f"{r['model'][:25]:<25} | {r['status']:<14} | {r.get('compile_attempts', 1):<5} | "
-            f"{r['tokens_used']:<8} | {r['time_taken_sec']:<8.2f} | {r['tokens_per_sec']:<8.2f} | "
-            f"{r.get('total_compile_time_sec', 0.0):<11.3f}"
+            models.sort(key=extract_params)
+        except Exception as e:
+            print(f"Could not fetch models from Ollama instance: {e}")
+            return
+
+        if not models:
+            print("No local models found in your Ollama deployment.")
+            return
+
+        print(f"Found {len(models)} model(s) to benchmark. Initiating pipeline...\n")
+
+        # One EventLog + one telemetry thread for the *entire* program run,
+        # started before the first model and stopped after the last.
+        event_log = EventLog()
+        telemetry_stop_event = threading.Event()
+        telemetry_thread = threading.Thread(
+            target=telemetry_worker,
+            args=(args.telemetry_interval, telemetry_stop_event, event_log),
+            daemon=True,
+            name="TelemetryWorker",
         )
-    print("=" * 100)
+        telemetry_thread.start()
+        print(
+            f"Hardware telemetry thread started (sampling every {args.telemetry_interval}s for the whole run).\n"
+        )
 
-    if args.chrome_trace:
-        print()
-        export_chrome_trace(results, args.chrome_trace, event_log)
+        results = []
+        previous_model = None
+        cooldown_open = False
+        total = len(models)
+        print("Evaluating models: " + ", ".join(models) + "\n")
+        try:
+            for n, model in enumerate(models, 1):
+                print(f"[{n}/{total}] Running benchmark on: {model}...")
+                if previous_model is not None:
+                    try:
+                        print(f"      -> Unloading previous model: {previous_model}")
+                        subprocess.run(
+                            ["ollama", "delete", previous_model],
+                            check=False,
+                            capture_output=True,
+                        )
+                    except Exception as e:
+                        print(
+                            f"      [WARN] Could not unload previous model '{previous_model}': {e}"
+                        )
+                    if cooldown_open:
+                        event_log.cooldown_end(to_model=model)
+                        cooldown_open = False
+
+                res = evaluate_model(model, event_log, task, previous_model)
+                results.append(res)
+
+                event_log.cooldown_begin(from_model=model)
+                cooldown_open = True
+
+                previous_model = model
+                try:
+                    # Save results using task name prefix or suffix so they don't overwrite if running multiple tasks
+                    output_file_name = args.output
+                    if len(task_paths) > 1:
+                        # e.g., ollama_benchmark_results_rule90_c.json
+                        base, ext = os.path.splitext(args.output)
+                        output_file_name = f"{base}_{task['name']}{ext}"
+                    with open(output_file_name, "w", encoding="utf-8") as json_file:
+                        json.dump(results, json_file, indent=4)
+                except Exception as e:
+                    print(f"Failed to write results to JSON file: {e}")
+        finally:
+            if cooldown_open:
+                event_log.cooldown_end(to_model=None)
+            telemetry_stop_event.set()
+            telemetry_thread.join(timeout=10)
+
+        print("\n" + "=" * 100)
+        print(
+            f"{'MODEL':<25} | {'STATUS':<14} | {'TRIES':<5} | {'TOKENS':<8} | {'TIME (s)':<8} | {'TOK/s':<8} | {'COMPILE (s)':<11}"
+        )
+        print("=" * 100)
+        for r in results:
+            print(
+                f"{r['model'][:25]:<25} | {r['status']:<14} | {r.get('compile_attempts', 1):<5} | "
+                f"{r['tokens_used']:<8} | {r['time_taken_sec']:<8.2f} | {r['tokens_per_sec']:<8.2f} | "
+                f"{r.get('total_compile_time_sec', 0.0):<11.3f}"
+            )
+        print("=" * 100)
+
+        if args.chrome_trace:
+            print()
+            trace_path = args.chrome_trace
+            if len(task_paths) > 1:
+                base, ext = os.path.splitext(args.chrome_trace)
+                trace_path = f"{base}_{task['name']}{ext}"
+            export_chrome_trace(results, trace_path, event_log)
 
 
 if __name__ == "__main__":

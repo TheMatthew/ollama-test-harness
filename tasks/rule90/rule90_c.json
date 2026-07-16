@@ -1,0 +1,18 @@
+{
+  "name": "rule90_c",
+  "language": "c",
+  "file_extension": "c",
+  "prompt_file": "rule90_c.prompt.md",
+
+  "system_prompt": "You are a careful {language} programmer. Respond only with the requested code, wrapped in a single ```{language} ... ``` block, and no explanation outside the code block.",
+
+  "build_command": ["gcc", "-Wall", "-Wextra", "{src}", "-o", "{bin}"],
+  "run_command": ["{bin}"],
+
+  "validation": [
+    { "type": "line_count", "expected": 32 },
+    { "type": "line_width", "width": 64 },
+    { "type": "single_char_at", "line": 0, "index": 32, "char": "#", "label": "Generation 0" },
+    { "type": "symmetric_pair", "line": 1, "indices": [31, 33], "char": "#", "label": "Generation 1" }
+  ]
+}
