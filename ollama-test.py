@@ -291,6 +291,9 @@ def run_validation_rules(program_output, rules):
       line_width     {width}
       single_char_at {line, index, char, label?}
       symmetric_pair {line, indices: [..], char, label?}
+      contains_all   {substrings: [..]}
+      contains_any   {substrings: [..]}
+      contains_count {substring, expected}
 
     Returns:
         (passed: bool, errors: list[str], notes: str)
@@ -347,6 +350,30 @@ def run_validation_rules(program_output, rules):
                 for idx in indices:
                     if target[idx] != char:
                         errors.append(f"{label} index {idx} is '{target[idx]}', expected '{char}'.")
+
+        elif rtype == "contains_all":
+            substrings = rule["substrings"]
+            for needle in substrings:
+                if needle not in program_output:
+                    errors.append(f"Program output did not contain required text: {needle!r}.")
+
+        elif rtype == "contains_any":
+            substrings = rule["substrings"]
+            if not any(needle in program_output for needle in substrings):
+                errors.append(
+                    "Program output did not contain any of the required text fragments: "
+                    + ", ".join(repr(s) for s in substrings)
+                    + "."
+                )
+
+        elif rtype == "contains_count":
+            needle = rule["substring"]
+            expected = rule["expected"]
+            actual = program_output.count(needle)
+            if actual != expected:
+                errors.append(
+                    f"Program output contained {actual} occurrence(s) of {needle!r}, expected {expected}."
+                )
 
         else:
             errors.append(f"Unknown validation rule type '{rtype}' in task config — skipped.")

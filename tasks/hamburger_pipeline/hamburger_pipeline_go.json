@@ -1,0 +1,18 @@
+{
+  "name": "hamburger_pipeline_go",
+  "language": "go",
+  "file_extension": "go",
+  "prompt_file": "hamburger_pipeline_go.prompt.md",
+
+  "system_prompt": "You are a careful {language} programmer. Respond only with the requested code, wrapped in a single ```{language} ... ``` block, and no explanation outside the code block.",
+
+  "build_command": ["go", "build", "-o", "{bin}", "{src}"],
+  "run_command": ["{bin}"],
+
+  "validation": [
+    { "type": "contains_count", "substring": "produced bread", "expected": 8 },
+    { "type": "contains_count", "substring": "produced burger", "expected": 4 },
+    { "type": "contains_count", "substring": "produced tomato", "expected": 4 },
+    { "type": "contains_count", "substring": "assembled hamburger", "expected": 4 }
+  ]
+}
