@@ -441,6 +441,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             "model": model_name,
             "messages": messages,
             "stream": False,
+            "keep_alive": 0,
         }
         print(
             f"      -> Sending request to Ollama. Polling GPU every 3s (hardware telemetry runs continuously in the background)..."
@@ -571,12 +572,6 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
         c_code = extract_code_block(raw_content, task["language"])
 
-        if not c_code:
-            metrics["compiler_errors"] = (
-                "Failed to extract a valid code block from LLM response."
-            )
-            return metrics
-
         # ------------------------------------------------------------------
         # Compile / test retry loop — up to MAX_COMPILE_ATTEMPTS iterations.
         # On each failure the error is fed back to the LLM as a follow-up
@@ -584,18 +579,106 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         # ------------------------------------------------------------------
         MAX_COMPILE_ATTEMPTS = 6
         last_error = None
+        last_failure_type = None   # "no_code" | "compile" | "runtime" | "validation"
+        last_failed_code = None    # the code that was tried on the last failing attempt
+        last_program_output = None # captured stdout from the last failed run (validation failures only)
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
             metrics["compile_attempts"] = attempt
 
-            # On attempts > 1 ask the LLM to fix the previous error
+            # Check for a missing code block on attempt 1 (subsequent attempts
+            # perform this check inside the fix-request block below).
+            if attempt == 1 and not c_code:
+                last_error = "Failed to extract a valid code block from LLM response."
+                last_failure_type = "no_code"
+                last_failed_code = None
+                metrics["iteration_history"].append(
+                    {"attempt": attempt, "error": last_error, "c_code": None}
+                )
+                print(
+                    f"      -> [Attempt {attempt}] No code block extracted from initial LLM response."
+                )
+                continue
+
+            # On attempts > 1 ask the LLM to fix the previous error.
+            # Prompt wording is tailored to the failure type so the model
+            # understands exactly what went wrong, and the failing code is
+            # always included so the model doesn't have to guess what it
+            # previously produced.
             if attempt > 1:
+                lang = task['language']
+
+                # --- build the code snippet section ---
+                if last_failed_code:
+                    code_section = (
+                        f"Here is the code from attempt {attempt - 1} that failed:\n\n"
+                        f"```{lang}\n{last_failed_code}\n```\n\n"
+                    )
+                else:
+                    code_section = ""
+
+                # --- build the failure-type-specific intro + error section ---
+                if last_failure_type == "no_code":
+                    intro = (
+                        f"Your previous response did not contain a fenced "
+                        f"```{lang} ... ``` code block. Please respond with "
+                        f"only the complete {lang} implementation inside a single "
+                        f"```{lang} ... ``` block and nothing outside it."
+                    )
+                    error_section = ""
+
+                elif last_failure_type == "compile":
+                    intro = (
+                        f"The {lang} code you provided failed to compile."
+                    )
+                    error_section = (
+                        f"Compiler error (attempt {attempt - 1}):\n```\n{last_error}\n```\n\n"
+                    )
+
+                elif last_failure_type == "runtime":
+                    intro = (
+                        f"The {lang} code you provided compiled but crashed at runtime."
+                    )
+                    error_section = (
+                        f"Runtime error (attempt {attempt - 1}):\n```\n{last_error}\n```\n\n"
+                    )
+
+                elif last_failure_type == "validation":
+                    intro = (
+                        f"The {lang} code you provided compiled and ran, but its output "
+                        f"did not match the expected requirements."
+                    )
+                    output_preview = ""
+                    if last_program_output:
+                        preview_lines = last_program_output.splitlines()[:20]
+                        preview_text = "\n".join(preview_lines)
+                        if len(last_program_output.splitlines()) > 20:
+                            preview_text += f"\n... ({len(last_program_output.splitlines()) - 20} more lines)"
+                        output_preview = (
+                            f"Actual program output (attempt {attempt - 1}):\n"
+                            f"```\n{preview_text}\n```\n\n"
+                        )
+                    error_section = (
+                        f"Validation errors (attempt {attempt - 1}):\n{last_error}\n\n"
+                        + output_preview
+                    )
+
+                else:
+                    # Fallback for unexpected failure types
+                    intro = (
+                        f"The {lang} code you provided failed to compile/run or "
+                        f"produced incorrect output."
+                    )
+                    error_section = (
+                        f"Error (attempt {attempt - 1}):\n{last_error}\n\n"
+                    )
+
                 fix_prompt = (
-                    f"The {task['language']} code you provided failed to compile/run or "
-                    f"produced incorrect output.\n\n"
-                    f"Error (attempt {attempt - 1}):\n{last_error}\n\n"
+                    f"{intro}\n\n"
+                    f"{code_section}"
+                    f"{error_section}"
                     f"Please fix the code and return the corrected version wrapped in a single "
-                    f"```{task['language']} ... ``` block. Do not include any explanation outside "
+                    f"```{lang} ... ``` block. Do not include any explanation outside "
                     f"the code block."
                 )
                 print(
@@ -607,6 +690,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     "model": model_name,
                     "messages": messages,
                     "stream": False,
+                    "keep_alive": 0,
                 }
                 event_log.span_begin("Fix Request", model_name, attempt=attempt)
                 try:
@@ -630,6 +714,8 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                         last_error = (
                             "Failed to extract a valid code block from LLM response."
                         )
+                        last_failure_type = "no_code"
+                        last_failed_code = None
                         metrics["iteration_history"].append(
                             {"attempt": attempt, "error": last_error, "c_code": None}
                         )
@@ -682,6 +768,8 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
                 if compile_res.returncode != 0:
                     last_error = compile_res.stderr.strip()
+                    last_failure_type = "compile"
+                    last_failed_code = c_code
                     metrics["iteration_history"].append(
                         {"attempt": attempt, "error": last_error, "c_code": c_code}
                     )
@@ -709,6 +797,8 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     "Run", model_name, attempt=attempt, returncode=e.returncode
                 )
                 last_error = f"Runtime error (exit {e.returncode}): {e.stderr.strip()}"
+                last_failure_type = "runtime"
+                last_failed_code = c_code
                 metrics["iteration_history"].append(
                     {"attempt": attempt, "error": last_error, "c_code": c_code}
                 )
@@ -717,6 +807,8 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             except Exception as e:
                 event_log.span_end("Run", model_name, attempt=attempt, error=str(e))
                 last_error = f"Execution failed: {e}"
+                last_failure_type = "runtime"
+                last_failed_code = c_code
                 metrics["iteration_history"].append(
                     {"attempt": attempt, "error": last_error, "c_code": c_code}
                 )
@@ -740,6 +832,9 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
             if not passed:
                 last_error = "\n".join(f"- {e}" for e in validation_errors)
+                last_failure_type = "validation"
+                last_failed_code = c_code
+                last_program_output = program_output
                 metrics["iteration_history"].append(
                     {"attempt": attempt, "error": last_error, "c_code": c_code}
                 )
@@ -781,6 +876,14 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             metrics["time_taken_sec"] = time.monotonic() - wall_start
         if "run_start_time" not in metrics:
             metrics["run_start_time"] = wall_start_ts
+
+    # Save the individual run report to the output directory
+    report_path = os.path.join(out_dir, "ollama-report.json")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=4)
+    except Exception as e:
+        print(f"      [WARN] Failed to save run report: {e}")
 
     return metrics
 
@@ -1286,17 +1389,6 @@ def main():
             for n, model in enumerate(models, 1):
                 print(f"[{n}/{total}] Running benchmark on: {model}...")
                 if previous_model is not None:
-                    try:
-                        print(f"      -> Unloading previous model: {previous_model}")
-                        subprocess.run(
-                            ["ollama", "delete", previous_model],
-                            check=False,
-                            capture_output=True,
-                        )
-                    except Exception as e:
-                        print(
-                            f"      [WARN] Could not unload previous model '{previous_model}': {e}"
-                        )
                     if cooldown_open:
                         event_log.cooldown_end(to_model=model)
                         cooldown_open = False
