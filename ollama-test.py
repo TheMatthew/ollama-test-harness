@@ -392,6 +392,23 @@ def run_validation_rules(program_output, rules):
 # ---------------------------------------------------------------------------
 
 
+def unload_model(model_name):
+    """Ask Ollama to evict *model_name* from GPU/CPU memory.
+
+    Ollama unloads a model when it receives a request with keep_alive=0.
+    We use /api/generate with an empty prompt so no tokens are generated.
+    """
+    try:
+        print(f"      -> Unloading model from memory: {model_name}")
+        requests.post(
+            f"{OLLAMA_HOST}/api/generate",
+            json={"model": model_name, "prompt": "", "keep_alive": 0},
+            timeout=30,
+        )
+    except Exception as e:
+        print(f"      [WARN] Could not unload model '{model_name}': {e}")
+
+
 def evaluate_model(model_name, event_log, task, previous_model=None):
     """Processes generation, compilation, and testing workflows for a target model.
 
@@ -441,7 +458,6 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             "model": model_name,
             "messages": messages,
             "stream": False,
-            "keep_alive": 0,
         }
         print(
             f"      -> Sending request to Ollama. Polling GPU every 3s (hardware telemetry runs continuously in the background)..."
@@ -582,6 +598,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         last_failure_type = None   # "no_code" | "compile" | "runtime" | "validation"
         last_failed_code = None    # the code that was tried on the last failing attempt
         last_program_output = None # captured stdout from the last failed run (validation failures only)
+        consecutive_no_code = 0    # consecutive attempts that produced no code block
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
             metrics["compile_attempts"] = attempt
@@ -592,6 +609,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                 last_error = "Failed to extract a valid code block from LLM response."
                 last_failure_type = "no_code"
                 last_failed_code = None
+                consecutive_no_code += 1
                 metrics["iteration_history"].append(
                     {"attempt": attempt, "error": last_error, "c_code": None}
                 )
@@ -619,12 +637,33 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
                 # --- build the failure-type-specific intro + error section ---
                 if last_failure_type == "no_code":
-                    intro = (
-                        f"Your previous response did not contain a fenced "
-                        f"```{lang} ... ``` code block. Please respond with "
-                        f"only the complete {lang} implementation inside a single "
-                        f"```{lang} ... ``` block and nothing outside it."
-                    )
+                    # Escalate prompt wording with each consecutive empty response.
+                    # Level 0 (first no_code): polite reminder
+                    # Level 1 (second no_code): explicit instruction, restate the rule
+                    # Level 2+ (third+ no_code): forceful system-level override
+                    level = consecutive_no_code - 1  # consecutive_no_code already incremented
+                    if level <= 0:
+                        intro = (
+                            f"Your previous response did not contain a fenced "
+                            f"```{lang} ... ``` code block. Please respond with "
+                            f"only the complete {lang} implementation inside a single "
+                            f"```{lang} ... ``` block and nothing outside it."
+                        )
+                    elif level == 1:
+                        intro = (
+                            f"IMPORTANT: You must respond with ONLY a fenced code block. "
+                            f"Your response must start with ```{lang} and end with ```. "
+                            f"Do not include any prose, explanation, or text outside the "
+                            f"code block. Provide the complete {lang} solution now."
+                        )
+                    else:
+                        intro = (
+                            f"SYSTEM INSTRUCTION: You are to respond ONLY with a "
+                            f"```{lang}\\n...\\n``` fenced code block containing the full "
+                            f"{lang} solution. No other text is permitted outside the "
+                            f"code block — not before it, not after it. "
+                            f"Begin your response with ```{lang} immediately."
+                        )
                     error_section = ""
 
                 elif last_failure_type == "compile":
@@ -690,7 +729,6 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     "model": model_name,
                     "messages": messages,
                     "stream": False,
-                    "keep_alive": 0,
                 }
                 event_log.span_begin("Fix Request", model_name, attempt=attempt)
                 try:
@@ -716,12 +754,26 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                         )
                         last_failure_type = "no_code"
                         last_failed_code = None
+                        consecutive_no_code += 1
                         metrics["iteration_history"].append(
                             {"attempt": attempt, "error": last_error, "c_code": None}
                         )
                         print(
                             f"      -> [Attempt {attempt}] No code block extracted from LLM response."
                         )
+                        # After 3 consecutive empty responses (escalation exhausted) give up early.
+                        MAX_CONSECUTIVE_NO_CODE = 3
+                        if consecutive_no_code >= MAX_CONSECUTIVE_NO_CODE:
+                            print(
+                                f"      -> Aborting: {consecutive_no_code} consecutive responses with no code block."
+                            )
+                            last_error = (
+                                f"Aborted after {consecutive_no_code} consecutive responses "
+                                f"with no fenced code block."
+                            )
+                            metrics["compiler_errors"] = last_error
+                            metrics["test_notes"] = last_error
+                            break
                         continue
                 except Exception as e:
                     event_log.span_end(
@@ -738,6 +790,9 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             suffix = f"_iter{attempt}" if attempt > 1 else ""
             src_file = os.path.join(out_dir, f"{task['name']}{suffix}.{task['file_extension']}")
             bin_file = os.path.join(out_dir, f"{task['name']}{suffix}")
+
+            # A valid code block was extracted — reset the consecutive empty counter.
+            consecutive_no_code = 0
 
             # Write source
             with open(src_file, "w") as f:
@@ -1398,6 +1453,11 @@ def main():
 
                 event_log.cooldown_begin(from_model=model)
                 cooldown_open = True
+
+                # Unload this model before the next one loads to free GPU memory.
+                next_model = models[n] if n < len(models) else None
+                if next_model != model:
+                    unload_model(model)
 
                 previous_model = model
                 try:
