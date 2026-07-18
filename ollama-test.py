@@ -599,6 +599,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         last_failed_code = None    # the code that was tried on the last failing attempt
         last_program_output = None # captured stdout from the last failed run (validation failures only)
         consecutive_no_code = 0    # consecutive attempts that produced no code block
+        prev_c_code = None         # code extracted on the previous attempt (for duplicate detection)
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
             metrics["compile_attempts"] = attempt
@@ -793,6 +794,19 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
             # A valid code block was extracted — reset the consecutive empty counter.
             consecutive_no_code = 0
+
+            # If the model produced the exact same code as last attempt it is
+            # stuck in a loop and further retries will not help.
+            if attempt > 1 and c_code == prev_c_code:
+                last_error = (
+                    f"Aborted: attempt {attempt} produced identical code to attempt {attempt - 1}. "
+                    f"Model is not making progress."
+                )
+                metrics["compiler_errors"] = last_error
+                metrics["test_notes"] = last_error
+                print(f"      -> [Attempt {attempt}] Code unchanged from previous attempt — aborting.")
+                break
+            prev_c_code = c_code
 
             # Write source
             with open(src_file, "w") as f:
