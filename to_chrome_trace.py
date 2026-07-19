@@ -230,6 +230,7 @@ def evaluate_model(model_name, previous_model=None):
     }
     wall_start = time.monotonic()
     wall_start_ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    out_dir = model_output_dir(model_name)
 
     try:
         # Check running models via /api/ps and unload if they don't match the target model
@@ -412,6 +413,13 @@ def evaluate_model(model_name, previous_model=None):
             metrics["compiler_errors"] = (
                 "Failed to extract valid C source block from LLM response."
             )
+            # Save the individual run report to the output directory
+            report_path = os.path.join(out_dir, "ollama-report.json")
+            try:
+                with open(report_path, "w", encoding="utf-8") as f:
+                    json.dump(metrics, f, indent=4)
+            except Exception as e:
+                print(f"      [WARN] Failed to save run report: {e}")
             return metrics
 
         # ------------------------------------------------------------------
@@ -420,7 +428,6 @@ def evaluate_model(model_name, previous_model=None):
         # prompt so it can self-correct.
         # ------------------------------------------------------------------
         MAX_COMPILE_ATTEMPTS = 6
-        out_dir = model_output_dir(model_name)
         last_error = None
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
@@ -593,6 +600,14 @@ def evaluate_model(model_name, previous_model=None):
         if "run_start_time" not in metrics:
             metrics["run_start_time"] = wall_start_ts
 
+    # Save the individual run report to the output directory
+    report_path = os.path.join(out_dir, "ollama-report.json")
+    try:
+        with open(report_path, "w", encoding="utf-8") as f:
+            json.dump(metrics, f, indent=4)
+    except Exception as e:
+        print(f"      [WARN] Failed to save run report: {e}")
+
     return metrics
 
 
@@ -707,22 +722,7 @@ def convert_to_chrome_trace(benchmarks: list) -> dict:
     prev_temp: float | None = None
     prev_power: float | None = None
 
-    previous_model: str | None = None
     for idx, entry in enumerate(benchmarks):
-        # Unload previous model (optional but highly recommended for clean benchmarks)
-        if previous_model is not None:
-            try:
-                print(f"      -> Attempting to unload previous model: {previous_model}")
-                subprocess.run(
-                    ["ollama", "delete", previous_model],
-                    check=False,
-                    capture_output=True,
-                )
-            except Exception as e:
-                print(
-                    f"      [WARN] Could not explicitly delete previous model '{previous_model}': {e}"
-                )
-        previous_model = model
 
         # Prefer live telemetry collected during inference; fall back to cooldown
         telem = entry.get("gpu_telemetry") or entry.get("cooldown_telemetry", [])
