@@ -278,6 +278,58 @@ def extract_code_block(response_text, language):
     return None
 
 
+def generate_output_hint(rules):
+    """Produce a short human-readable hint about what correct output must contain.
+
+    Only generates hints for rule types where a concrete example is useful
+    to the model (contains_count, contains_all, line_count).  Returns an
+    empty string if no useful hint can be constructed.
+    """
+    lines = []
+
+    for rule in rules:
+        rtype = rule.get("type")
+
+        if rtype == "contains_count":
+            needle = rule["substring"]
+            expected = rule["expected"]
+            lines.append(
+                f"  - The exact text {needle!r} must appear exactly {expected} time(s)."
+            )
+
+        elif rtype == "contains_all":
+            for s in rule.get("substrings", []):
+                lines.append(f"  - The exact text {s!r} must appear at least once.")
+
+        elif rtype == "line_count":
+            lines.append(f"  - The output must have exactly {rule['expected']} non-blank line(s).")
+
+        elif rtype == "line_width":
+            lines.append(f"  - Every output line must be exactly {rule['width']} characters wide.")
+
+    if not lines:
+        return ""
+
+    # Build a short example block showing the required output fragments.
+    example_lines = []
+    for rule in rules:
+        if rule.get("type") == "contains_count":
+            needle = rule["substring"]
+            expected = rule["expected"]
+            for _ in range(min(expected, 3)):  # show at most 3 sample lines per rule
+                example_lines.append(needle + " ...")
+            if expected > 3:
+                example_lines.append(f"... ({expected - 3} more lines starting with {needle!r})")
+
+    hint = "Required output constraints:\n" + "\n".join(lines)
+    if example_lines:
+        hint += "\n\nExample of required output lines (illustrative, order may vary):\n"
+        hint += "\n".join(example_lines[:10])  # cap total example lines at 10
+        if len(example_lines) > 10:
+            hint += f"\n... ({len(example_lines) - 10} more lines omitted)"
+    return hint
+
+
 def run_validation_rules(program_output, rules):
     """Generic, declarative output validator.
 
@@ -699,9 +751,12 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                             f"Actual program output (attempt {attempt - 1}):\n"
                             f"```\n{preview_text}\n```\n\n"
                         )
+                    output_hint = generate_output_hint(task.get("validation", []))
+                    hint_section = (f"\n{output_hint}\n\n") if output_hint else ""
                     error_section = (
                         f"Validation errors (attempt {attempt - 1}):\n{last_error}\n\n"
                         + output_preview
+                        + hint_section
                     )
 
                 else:
