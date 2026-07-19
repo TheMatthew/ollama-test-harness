@@ -278,6 +278,35 @@ def extract_code_block(response_text, language):
     return None
 
 
+def unescape_response(text, model_name="model"):
+    """Replace literal escape sequences in LLM responses with their actual characters.
+
+    Some models emit ``\\n`` (two characters: backslash + n) instead of a real
+    newline, and ``\\t`` instead of a real tab.  This normalises both so that
+    code extracted from the response compiles and runs as expected.
+
+    Emits a warning to stdout whenever a substitution is actually made so the
+    caller knows the raw response contained escape-sequence literals.
+    """
+    warnings = []
+
+    if r"\n" in text:
+        warnings.append(r"\n → newline")
+        text = text.replace(r"\n", "\n")
+
+    if r"\t" in text:
+        warnings.append(r"\t → 4 spaces")
+        text = text.replace(r"\t", "    ")
+
+    if warnings:
+        print(
+            f"      [WARN] [{model_name}] Response contained literal escape sequences "
+            f"that were replaced: {', '.join(warnings)}"
+        )
+
+    return text
+
+
 def generate_output_hint(rules):
     """Produce a short human-readable hint about what correct output must contain.
 
@@ -635,7 +664,9 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         )
         # tokens_per_sec is computed after the retry loop once all attempts are summed.
 
-        raw_content = res_json.get("message", {}).get("content", "")
+        raw_content = unescape_response(
+            res_json.get("message", {}).get("content", ""), model_name
+        )
         messages.append({"role": "assistant", "content": raw_content})
         metrics["chat_history_file"] = save_chat_history(out_dir, messages)
 
@@ -794,7 +825,9 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     )
                     fix_r.raise_for_status()
                     fix_json = fix_r.json()
-                    raw_content = fix_json.get("message", {}).get("content", "")
+                    raw_content = unescape_response(
+                        fix_json.get("message", {}).get("content", ""), model_name
+                    )
                     messages.append({"role": "assistant", "content": raw_content})
                     metrics["chat_history_file"] = save_chat_history(out_dir, messages)
                     event_log.span_end("Fix Request", model_name, attempt=attempt)
