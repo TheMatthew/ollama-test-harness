@@ -777,7 +777,77 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                             metrics["test_notes"] = last_error
                             metrics["failure_type"] = "no_code"
                             break
-                        continue
+
+                        # After 2 consecutive empty responses, try a fresh single-turn
+                        # request with no accumulated chat history.  Some models get
+                        # confused by long back-and-forth and respond better to a clean
+                        # slate with a direct, forceful instruction.
+                        if consecutive_no_code == 2:
+                            print(
+                                f"      -> [Attempt {attempt}] 2 consecutive no-code responses — "
+                                f"sending fresh single-turn request to reset context."
+                            )
+                            fresh_messages = [
+                                {
+                                    "role": "system",
+                                    "content": (
+                                        f"You are to respond ONLY with a fenced ```{lang}\\n...\\n``` "
+                                        f"code block. No other text is permitted."
+                                    ),
+                                },
+                                {
+                                    "role": "user",
+                                    "content": (
+                                        f"Provide the complete {lang} solution to the following task. "
+                                        f"Your entire response must be a single ```{lang} ... ``` "
+                                        f"fenced code block and nothing else.\\n\\n"
+                                        + task["prompt"]
+                                    ),
+                                },
+                            ]
+                            try:
+                                fresh_r = requests.post(
+                                    f"{OLLAMA_HOST}/api/chat",
+                                    json={"model": model_name, "messages": fresh_messages, "stream": False},
+                                    timeout=3600,
+                                )
+                                fresh_r.raise_for_status()
+                                fresh_json = fresh_r.json()
+                                fresh_content = fresh_json.get("message", {}).get("content", "")
+                                fresh_code = extract_code_block(fresh_content, task["language"])
+                                metrics["tokens_used"] += fresh_json.get("eval_count", 0)
+                                extra_ns = fresh_json.get("eval_duration", 0)
+                                metrics["time_taken_sec"] += (
+                                    (extra_ns / 1_000_000_000.0) if extra_ns > 0 else 0
+                                )
+                                if fresh_code:
+                                    print(
+                                        f"      -> Fresh single-turn request succeeded — resuming with extracted code."
+                                    )
+                                    # Inject fresh exchange into messages so history is coherent.
+                                    messages.append({"role": "assistant", "content": fresh_content})
+                                    metrics["chat_history_file"] = save_chat_history(out_dir, messages)
+                                    c_code = fresh_code
+                                    consecutive_no_code = 0
+                                    # Skip the continue — fall through to compile/run below.
+                                    # We do this by breaking out of the no_code branch.
+                                else:
+                                    print(
+                                        f"      -> Fresh single-turn request also produced no code block."
+                                    )
+                                    consecutive_no_code += 1
+                                    messages.append({"role": "assistant", "content": fresh_content})
+                                    metrics["chat_history_file"] = save_chat_history(out_dir, messages)
+                            except Exception as fresh_e:
+                                print(f"      -> Fresh single-turn request failed: {fresh_e}")
+                                consecutive_no_code += 1
+
+                            if c_code:
+                                # Successfully got code — break out of the no_code handler
+                                # and fall through to the compile section below.
+                                pass
+                            else:
+                                continue
                 except Exception as e:
                     event_log.span_end(
                         "Fix Request", model_name, attempt=attempt, error=str(e)
