@@ -423,6 +423,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
     metrics = {
         "model": model_name,
         "status": "FAIL",
+        "failure_type": None,      # "no_code" | "compile" | "runtime" | "validation" | None (on pass)
         "tokens_used": 0,
         "time_taken_sec": 0.0,
         "tokens_per_sec": 0.0,
@@ -774,6 +775,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                             )
                             metrics["compiler_errors"] = last_error
                             metrics["test_notes"] = last_error
+                            metrics["failure_type"] = "no_code"
                             break
                         continue
                 except Exception as e:
@@ -804,6 +806,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                 )
                 metrics["compiler_errors"] = last_error
                 metrics["test_notes"] = last_error
+                metrics["failure_type"] = last_failure_type
                 print(f"      -> [Attempt {attempt}] Code unchanged from previous attempt — aborting.")
                 break
             prev_c_code = c_code
@@ -916,6 +919,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
             # All checks passed
             metrics["test_notes"] = validation_notes
+            metrics["failure_type"] = None
             status_label = "PASS" if attempt == 1 else f"PASS (iter {attempt})"
             metrics["status"] = status_label
             print(f"      -> [Attempt {attempt}] {status_label}")
@@ -926,6 +930,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             metrics["compiler_errors"] = (
                 last_error or "All compile/test attempts exhausted."
             )
+            metrics["failure_type"] = last_failure_type
             metrics["test_notes"] = (
                 f"Failed after {MAX_COMPILE_ATTEMPTS} attempt(s). Last error: {last_error}"
             )
@@ -1491,18 +1496,19 @@ def main():
             telemetry_stop_event.set()
             telemetry_thread.join(timeout=10)
 
-        print("\n" + "=" * 100)
+        print("\n" + "=" * 120)
         print(
-            f"{'MODEL':<25} | {'STATUS':<14} | {'TRIES':<5} | {'TOKENS':<8} | {'TIME (s)':<8} | {'TOK/s':<8} | {'COMPILE (s)':<11}"
+            f"{'MODEL':<25} | {'STATUS':<14} | {'FAIL TYPE':<12} | {'TRIES':<5} | {'TOKENS':<8} | {'TIME (s)':<8} | {'TOK/s':<8} | {'COMPILE (s)':<11}"
         )
-        print("=" * 100)
+        print("=" * 120)
         for r in results:
+            fail_type = r.get("failure_type") or ""
             print(
-                f"{r['model'][:25]:<25} | {r['status']:<14} | {r.get('compile_attempts', 1):<5} | "
+                f"{r['model'][:25]:<25} | {r['status']:<14} | {fail_type:<12} | {r.get('compile_attempts', 1):<5} | "
                 f"{r['tokens_used']:<8} | {r['time_taken_sec']:<8.2f} | {r['tokens_per_sec']:<8.2f} | "
                 f"{r.get('total_compile_time_sec', 0.0):<11.3f}"
             )
-        print("=" * 100)
+        print("=" * 120)
 
         if args.chrome_trace:
             print()
