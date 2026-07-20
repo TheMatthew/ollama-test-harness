@@ -684,6 +684,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         last_program_output = None # captured stdout from the last failed run (validation failures only)
         consecutive_no_code = 0    # consecutive attempts that produced no code block
         prev_c_code = None         # code extracted on the previous attempt (for duplicate detection)
+        consecutive_identical = 0  # how many consecutive attempts produced the same code
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
             metrics["compile_attempts"] = attempt
@@ -851,8 +852,8 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                         print(
                             f"      -> [Attempt {attempt}] No code block extracted from LLM response."
                         )
-                        # After 3 consecutive empty responses (escalation exhausted) give up early.
-                        MAX_CONSECUTIVE_NO_CODE = 3
+                        # After 4 consecutive empty responses (escalation exhausted) give up early.
+                        MAX_CONSECUTIVE_NO_CODE = 4
                         if consecutive_no_code >= MAX_CONSECUTIVE_NO_CODE:
                             print(
                                 f"      -> Aborting: {consecutive_no_code} consecutive responses with no code block."
@@ -955,19 +956,28 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             # A valid code block was extracted — reset the consecutive empty counter.
             consecutive_no_code = 0
 
-            # If the model produced the exact same code as last attempt it is
-            # stuck in a loop and further retries will not help.
+            # Track consecutive identical code outputs.  If the model produces
+            # the same code 3 times in a row it is truly stuck; abort early.
             if attempt > 1 and c_code == prev_c_code:
+                consecutive_identical += 1
+            else:
+                consecutive_identical = 0
+            prev_c_code = c_code
+
+            MAX_CONSECUTIVE_IDENTICAL = 3
+            if consecutive_identical >= MAX_CONSECUTIVE_IDENTICAL:
                 last_error = (
-                    f"Aborted: attempt {attempt} produced identical code to attempt {attempt - 1}. "
+                    f"Aborted: last {MAX_CONSECUTIVE_IDENTICAL + 1} attempts produced identical code. "
                     f"Model is not making progress."
                 )
                 metrics["compiler_errors"] = last_error
                 metrics["test_notes"] = last_error
                 metrics["failure_type"] = last_failure_type
-                print(f"      -> [Attempt {attempt}] Code unchanged from previous attempt — aborting.")
+                print(
+                    f"      -> [Attempt {attempt}] Code unchanged for "
+                    f"{MAX_CONSECUTIVE_IDENTICAL + 1} consecutive attempts — aborting."
+                )
                 break
-            prev_c_code = c_code
 
             # Write source
             with open(src_file, "w") as f:
