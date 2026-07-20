@@ -267,6 +267,10 @@ def extract_code_block(response_text, language):
 
     Prefers a block tagged with the task's language (```c, ```python, ...)
     and falls back to any fenced block if that tag isn't present.
+
+    As a last resort, if the response contains no fences at all but looks
+    like it might be raw code (starts with common language markers), return
+    the whole response stripped of leading/trailing prose lines.
     """
     pattern = r"```" + re.escape(language) + r"\s*(.*?)\s*```"
     match = re.search(pattern, response_text, re.DOTALL | re.IGNORECASE)
@@ -275,19 +279,50 @@ def extract_code_block(response_text, language):
     match = re.search(r"```\w*\s*(.*?)\s*```", response_text, re.DOTALL)
     if match:
         return match.group(1)
+
+    # Heuristic fallback: if there are no fences but the response looks like
+    # bare code, extract it.  This helps models that forget fences but still
+    # produce valid source.
+    stripped = response_text.strip()
+    if "```" not in stripped:
+        # Language-specific heuristics for "this looks like code"
+        code_indicators = {
+            "go": (r"^package\s+\w+", None),
+            "c": (r"^#include\s+[<\"]", None),
+            "rust": (r"^(use\s+|fn\s+main|mod\s+)", None),
+            "python": (r"^(import\s+|from\s+|def\s+|class\s+)", None),
+        }
+        indicator = code_indicators.get(language)
+        if indicator:
+            pattern_str, _ = indicator
+            if re.search(pattern_str, stripped, re.MULTILINE):
+                return stripped
+
     return None
 
 
 def unescape_response(text, model_name="model"):
-    """Replace literal escape sequences in LLM responses with their actual characters.
+    """Replace literal escape sequences only when the entire response is a single line.
 
-    Some models emit ``\\n`` (two characters: backslash + n) instead of a real
-    newline, and ``\\t`` instead of a real tab.  This normalises both so that
-    code extracted from the response compiles and runs as expected.
+    Some models emit the *entire* code as one long string with ``\\n`` (two
+    characters: backslash + n) instead of real newlines, and ``\\t`` instead of
+    real tabs.  This makes code extraction fail because the fenced block regex
+    expects actual newlines between the opening/closing ``` markers.
 
-    Emits a warning to stdout whenever a substitution is actually made so the
-    caller knows the raw response contained escape-sequence literals.
+    However, a response that already contains real newlines almost certainly
+    uses \\n *inside string literals* (e.g. fmt.Println("hello\\nworld")) where
+    replacing them would corrupt the code.
+
+    Heuristic: only unescape when the text has fewer than 3 real newlines (i.e.
+    the model jammed everything onto ~1 line).  This catches the pathological
+    "all on one line" case without destroying legitimate escape sequences in
+    multi-line code.
     """
+    real_newlines = text.count("\n")
+    if real_newlines >= 3:
+        # Response already has real structure — don't touch escape sequences
+        return text
+
     warnings = []
 
     if r"\n" in text:
@@ -300,8 +335,8 @@ def unescape_response(text, model_name="model"):
 
     if warnings:
         print(
-            f"      [WARN] [{model_name}] Response contained literal escape sequences "
-            f"that were replaced: {', '.join(warnings)}"
+            f"      [WARN] [{model_name}] Response appeared to be a single-line dump with "
+            f"literal escape sequences — replaced: {', '.join(warnings)}"
         )
 
     return text
@@ -819,6 +854,12 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     "messages": messages,
                     "stream": False,
                 }
+                # Bump temperature on later attempts to help the model escape
+                # repetitive outputs.  Default Ollama temp is 0.8; we nudge it
+                # up starting at attempt 3 so early retries stay deterministic
+                # while later ones explore more.
+                if attempt >= 3:
+                    fix_payload["options"] = {"temperature": min(0.8 + (attempt - 2) * 0.15, 1.4)}
                 event_log.span_begin("Fix Request", model_name, attempt=attempt)
                 try:
                     fix_r = requests.post(
