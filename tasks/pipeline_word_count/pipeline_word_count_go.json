@@ -1,0 +1,21 @@
+{
+  "name": "pipeline_word_count_go",
+  "language": "go",
+  "file_extension": "go",
+  "prompt_file": "pipeline_word_count_go.prompt.md",
+
+  "system_prompt": "You are a careful {language} programmer. Respond only with the requested code, wrapped in a single ```{language} ... ``` block, and no explanation outside the code block.",
+
+  "build_command": ["go", "build", "-o", "{bin}", "{src}"],
+  "run_command": ["{bin}"],
+  "run_timeout": 10,
+
+  "validation": [
+    { "type": "contains_count", "substring": "counted 4 words in \"the quick brown fox\"", "expected": 1 },
+    { "type": "contains_count", "substring": "counted 5 words in \"jumps over the lazy dog\"", "expected": 1 },
+    { "type": "contains_count", "substring": "counted 2 words in \"hello world\"", "expected": 1 },
+    { "type": "contains_count", "substring": "counted 5 words in \"go is a concurrent language\"", "expected": 1 },
+    { "type": "contains_count", "substring": "counted 1 words in \"one\"", "expected": 1 },
+    { "type": "contains_count", "substring": "total lines processed: 5", "expected": 1 }
+  ]
+}
