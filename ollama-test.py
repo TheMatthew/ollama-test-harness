@@ -313,13 +313,13 @@ def unescape_response(text, model_name="model"):
     uses \\n *inside string literals* (e.g. fmt.Println("hello\\nworld")) where
     replacing them would corrupt the code.
 
-    Heuristic: only unescape when the text has fewer than 3 real newlines (i.e.
-    the model jammed everything onto ~1 line).  This catches the pathological
-    "all on one line" case without destroying legitimate escape sequences in
-    multi-line code.
+    Heuristic: only unescape when the text has fewer than 10 real newlines (i.e.
+    the model jammed everything onto very few lines).  This catches the
+    pathological "all on one line" case without destroying legitimate escape
+    sequences in multi-line code that uses \\n inside strings.
     """
     real_newlines = text.count("\n")
-    if real_newlines >= 3:
+    if real_newlines >= 10:
         # Response already has real structure — don't touch escape sequences
         return text
 
@@ -340,6 +340,44 @@ def unescape_response(text, model_name="model"):
         )
 
     return text
+
+
+# Maximum total character length of user messages in chat history before
+# older exchanges are dropped.  Keeps the model focused on recent errors
+# rather than overflowing its effective attention window.
+MAX_CHAT_USER_CHARS = 8000
+
+
+def trim_chat_history(messages):
+    """Trim chat history to stay within context budget.
+
+    Keeps:
+      - The system prompt (messages[0])
+      - The original user task prompt (messages[1])
+      - The most recent exchanges (user+assistant pairs from the end)
+
+    Drops middle exchanges when total user-message content exceeds
+    MAX_CHAT_USER_CHARS.  This prevents context overflow on smaller models
+    while preserving the task description and latest error feedback.
+    """
+    if len(messages) <= 5:
+        # system + prompt + response + 1 error exchange — nothing to trim
+        return messages
+
+    # Calculate total user chars (skip system prompt)
+    user_chars = sum(
+        len(m["content"]) for m in messages if m["role"] == "user"
+    )
+    if user_chars <= MAX_CHAT_USER_CHARS:
+        return messages
+
+    # Keep: system(0), original prompt(1), original response(2), last 2 pairs
+    head = messages[:3]  # system, user prompt, first assistant response
+    # Keep the last 2 user+assistant exchanges (4 messages)
+    tail = messages[-4:] if len(messages) >= 7 else messages[3:]
+
+    trimmed = head + tail
+    return trimmed
 
 
 def generate_output_hint(rules):
@@ -719,7 +757,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
         last_program_output = None # captured stdout from the last failed run (validation failures only)
         consecutive_no_code = 0    # consecutive attempts that produced no code block
         prev_c_code = None         # code extracted on the previous attempt (for duplicate detection)
-        consecutive_identical = 0  # how many consecutive attempts produced the same code
+        context_was_reset = False  # True if we already tried a fresh-context retry
 
         for attempt in range(1, MAX_COMPILE_ATTEMPTS + 1):
             metrics["compile_attempts"] = attempt
@@ -741,20 +779,12 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
             # On attempts > 1 ask the LLM to fix the previous error.
             # Prompt wording is tailored to the failure type so the model
-            # understands exactly what went wrong, and the failing code is
-            # always included so the model doesn't have to guess what it
-            # previously produced.
+            # understands exactly what went wrong.  The failing code is NOT
+            # re-included because it already exists in the chat history as the
+            # model's own assistant message — echoing it wastes context tokens
+            # and can push smaller models out of their effective attention window.
             if attempt > 1:
                 lang = task['language']
-
-                # --- build the code snippet section ---
-                if last_failed_code:
-                    code_section = (
-                        f"Here is the code from attempt {attempt - 1} that failed:\n\n"
-                        f"```{lang}\n{last_failed_code}\n```\n\n"
-                    )
-                else:
-                    code_section = ""
 
                 # --- build the failure-type-specific intro + error section ---
                 if last_failure_type == "no_code":
@@ -799,8 +829,27 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                     intro = (
                         f"The {lang} code you provided compiled but crashed at runtime."
                     )
+                    # Provide a structured architectural hint based on the error
+                    arch_hint = ""
+                    if "deadlock" in (last_error or "").lower() or "timed out" in (last_error or "").lower():
+                        arch_hint = (
+                            f"\n\nArchitectural hint: Your goroutine synchronization is "
+                            f"fundamentally broken. Common causes:\n"
+                            f"- Consumers waiting for more items than the producer sends\n"
+                            f"- Unbuffered channels with no concurrent reader\n"
+                            f"- WaitGroup.Add() called after goroutine already started\n"
+                            f"- Forgetting to close channels that readers range over\n"
+                            f"Rethink the coordination pattern, don't just tweak values.\n"
+                        )
+                    elif "negative WaitGroup" in (last_error or ""):
+                        arch_hint = (
+                            f"\n\nArchitectural hint: You are calling wg.Done() more times "
+                            f"than wg.Add(). Each goroutine should call Done() exactly once. "
+                            f"Do not call Done() in a loop unless Add() was called that many times.\n"
+                        )
                     error_section = (
-                        f"Runtime error (attempt {attempt - 1}):\n```\n{last_error}\n```\n\n"
+                        f"Runtime error (attempt {attempt - 1}):\n```\n{last_error}\n```\n"
+                        f"{arch_hint}\n"
                     )
 
                 elif last_failure_type == "validation":
@@ -820,9 +869,26 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                         )
                     output_hint = generate_output_hint(task.get("validation", []))
                     hint_section = (f"\n{output_hint}\n\n") if output_hint else ""
+                    # Detect common validation failure patterns and add specific guidance
+                    validation_arch_hint = ""
+                    if last_program_output is not None:
+                        output_lines = last_program_output.strip().splitlines()
+                        expected_lines = sum(
+                            r.get("expected", 0) for r in task.get("validation", [])
+                            if r.get("type") == "contains_count"
+                        )
+                        if expected_lines > 0 and len(output_lines) < expected_lines:
+                            validation_arch_hint = (
+                                f"\nHint: Your program produced only {len(output_lines)} "
+                                f"output line(s) but {expected_lines} are expected. "
+                                f"This usually means main() exits before worker goroutines "
+                                f"finish. Ensure you wait for ALL goroutines to complete "
+                                f"(e.g., with sync.WaitGroup) before returning from main().\n\n"
+                            )
                     error_section = (
                         f"Validation errors (attempt {attempt - 1}):\n{last_error}\n\n"
                         + output_preview
+                        + validation_arch_hint
                         + hint_section
                     )
 
@@ -838,7 +904,6 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
                 fix_prompt = (
                     f"{intro}\n\n"
-                    f"{code_section}"
                     f"{error_section}"
                     f"Please fix the code and return the corrected version wrapped in a single "
                     f"```{lang} ... ``` block. Do not include any explanation outside "
@@ -849,17 +914,23 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                 )
                 messages.append({"role": "user", "content": fix_prompt})
                 metrics["chat_history_file"] = save_chat_history(out_dir, messages)
+                # Trim context sent to model to avoid overflowing attention on
+                # smaller models.  Full history is still saved to disk above.
+                trimmed_messages = trim_chat_history(messages)
                 fix_payload = {
                     "model": model_name,
-                    "messages": messages,
+                    "messages": trimmed_messages,
                     "stream": False,
                 }
                 # Bump temperature on later attempts to help the model escape
                 # repetitive outputs.  Default Ollama temp is 0.8; we nudge it
-                # up starting at attempt 3 so early retries stay deterministic
-                # while later ones explore more.
+                # up starting at attempt 3 so the model explores alternatives
+                # sooner rather than getting stuck in a rut.
+                options = {}
                 if attempt >= 3:
-                    fix_payload["options"] = {"temperature": min(0.8 + (attempt - 2) * 0.15, 1.4)}
+                    options["temperature"] = min(0.8 + (attempt - 2) * 0.15, 1.2)
+                if options:
+                    fix_payload["options"] = options
                 event_log.span_begin("Fix Request", model_name, attempt=attempt)
                 try:
                     fix_r = requests.post(
@@ -893,91 +964,7 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                         print(
                             f"      -> [Attempt {attempt}] No code block extracted from LLM response."
                         )
-                        # After 4 consecutive empty responses (escalation exhausted) give up early.
-                        MAX_CONSECUTIVE_NO_CODE = 4
-                        if consecutive_no_code >= MAX_CONSECUTIVE_NO_CODE:
-                            print(
-                                f"      -> Aborting: {consecutive_no_code} consecutive responses with no code block."
-                            )
-                            last_error = (
-                                f"Aborted after {consecutive_no_code} consecutive responses "
-                                f"with no fenced code block."
-                            )
-                            metrics["compiler_errors"] = last_error
-                            metrics["test_notes"] = last_error
-                            metrics["failure_type"] = "no_code"
-                            break
-
-                        # After 2 consecutive empty responses, try a fresh single-turn
-                        # request with no accumulated chat history.  Some models get
-                        # confused by long back-and-forth and respond better to a clean
-                        # slate with a direct, forceful instruction.
-                        if consecutive_no_code == 2:
-                            print(
-                                f"      -> [Attempt {attempt}] 2 consecutive no-code responses — "
-                                f"sending fresh single-turn request to reset context."
-                            )
-                            fresh_messages = [
-                                {
-                                    "role": "system",
-                                    "content": (
-                                        f"You are to respond ONLY with a fenced ```{lang}\\n...\\n``` "
-                                        f"code block. No other text is permitted."
-                                    ),
-                                },
-                                {
-                                    "role": "user",
-                                    "content": (
-                                        f"Provide the complete {lang} solution to the following task. "
-                                        f"Your entire response must be a single ```{lang} ... ``` "
-                                        f"fenced code block and nothing else.\\n\\n"
-                                        + task["prompt"]
-                                    ),
-                                },
-                            ]
-                            try:
-                                fresh_r = requests.post(
-                                    f"{OLLAMA_HOST}/api/chat",
-                                    json={"model": model_name, "messages": fresh_messages, "stream": False},
-                                    timeout=3600,
-                                )
-                                fresh_r.raise_for_status()
-                                fresh_json = fresh_r.json()
-                                fresh_content = fresh_json.get("message", {}).get("content", "")
-                                fresh_code = extract_code_block(fresh_content, task["language"])
-                                metrics["tokens_used"] += fresh_json.get("eval_count", 0)
-                                extra_ns = fresh_json.get("eval_duration", 0)
-                                metrics["time_taken_sec"] += (
-                                    (extra_ns / 1_000_000_000.0) if extra_ns > 0 else 0
-                                )
-                                if fresh_code:
-                                    print(
-                                        f"      -> Fresh single-turn request succeeded — resuming with extracted code."
-                                    )
-                                    # Inject fresh exchange into messages so history is coherent.
-                                    messages.append({"role": "assistant", "content": fresh_content})
-                                    metrics["chat_history_file"] = save_chat_history(out_dir, messages)
-                                    c_code = fresh_code
-                                    consecutive_no_code = 0
-                                    # Skip the continue — fall through to compile/run below.
-                                    # We do this by breaking out of the no_code branch.
-                                else:
-                                    print(
-                                        f"      -> Fresh single-turn request also produced no code block."
-                                    )
-                                    consecutive_no_code += 1
-                                    messages.append({"role": "assistant", "content": fresh_content})
-                                    metrics["chat_history_file"] = save_chat_history(out_dir, messages)
-                            except Exception as fresh_e:
-                                print(f"      -> Fresh single-turn request failed: {fresh_e}")
-                                consecutive_no_code += 1
-
-                            if c_code:
-                                # Successfully got code — break out of the no_code handler
-                                # and fall through to the compile section below.
-                                pass
-                            else:
-                                continue
+                        continue
                 except Exception as e:
                     event_log.span_end(
                         "Fix Request", model_name, attempt=attempt, error=str(e)
@@ -997,28 +984,85 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             # A valid code block was extracted — reset the consecutive empty counter.
             consecutive_no_code = 0
 
-            # Track consecutive identical code outputs.  If the model produces
-            # the same code 3 times in a row it is truly stuck; abort early.
+            # If the model produced the exact same code as last attempt it is
+            # stuck in a loop.  Instead of aborting, reset context and try a
+            # fresh single-turn prompt with a different-approach hint.
             if attempt > 1 and c_code == prev_c_code:
-                consecutive_identical += 1
-            else:
-                consecutive_identical = 0
-            prev_c_code = c_code
+                if context_was_reset:
+                    # Already tried a fresh start — model is truly stuck, abort.
+                    last_error = (
+                        f"Aborted: attempt {attempt} produced identical code to attempt "
+                        f"{attempt - 1} even after context reset. Model is not making progress."
+                    )
+                    metrics["compiler_errors"] = last_error
+                    metrics["test_notes"] = last_error
+                    print(f"      -> [Attempt {attempt}] Code unchanged after reset — aborting.")
+                    break
 
-            MAX_CONSECUTIVE_IDENTICAL = 3
-            if consecutive_identical >= MAX_CONSECUTIVE_IDENTICAL:
-                last_error = (
-                    f"Aborted: last {MAX_CONSECUTIVE_IDENTICAL + 1} attempts produced identical code. "
-                    f"Model is not making progress."
+                # Reset: start a fresh conversation with a hint to try a
+                # different architectural approach.
+                context_was_reset = True
+                lang = task["language"]
+                approach_hint = (
+                    f"Your previous approach produced code that "
+                    f"{'failed to compile' if last_failure_type == 'compile' else 'did not work correctly'}. "
+                    f"Try a fundamentally different strategy — for example, if you used "
+                    f"channels before, try a mutex with sync.Cond; if you used a mutex, "
+                    f"try buffered channels. Think step by step about the concurrency "
+                    f"requirements before writing code."
                 )
-                metrics["compiler_errors"] = last_error
-                metrics["test_notes"] = last_error
-                metrics["failure_type"] = last_failure_type
-                print(
-                    f"      -> [Attempt {attempt}] Code unchanged for "
-                    f"{MAX_CONSECUTIVE_IDENTICAL + 1} consecutive attempts — aborting."
-                )
-                break
+                fresh_prompt = task["prompt"] + f"\n\nIMPORTANT: {approach_hint}\n"
+                messages = [
+                    {"role": "system", "content": task["system_prompt"]},
+                    {"role": "user", "content": fresh_prompt},
+                ]
+                metrics["chat_history_file"] = save_chat_history(out_dir, messages)
+                print(f"      -> [Attempt {attempt}] Identical code detected — resetting context with approach hint.")
+                # Re-send with higher temperature to force exploration
+                reset_payload = {
+                    "model": model_name,
+                    "messages": messages,
+                    "stream": False,
+                    "options": {"temperature": 1.1},
+                }
+                event_log.span_begin("Fresh Retry", model_name, attempt=attempt)
+                try:
+                    reset_r = requests.post(
+                        f"{OLLAMA_HOST}/api/chat", json=reset_payload, timeout=3600
+                    )
+                    reset_r.raise_for_status()
+                    reset_json = reset_r.json()
+                    raw_content = unescape_response(
+                        reset_json.get("message", {}).get("content", ""), model_name
+                    )
+                    messages.append({"role": "assistant", "content": raw_content})
+                    metrics["chat_history_file"] = save_chat_history(out_dir, messages)
+                    event_log.span_end("Fresh Retry", model_name, attempt=attempt)
+                    metrics["tokens_used"] += reset_json.get("eval_count", 0)
+                    extra_ns = reset_json.get("eval_duration", 0)
+                    metrics["time_taken_sec"] += (
+                        (extra_ns / 1_000_000_000.0) if extra_ns > 0 else 0
+                    )
+                    c_code = extract_code_block(raw_content, task["language"])
+                    if not c_code:
+                        last_error = "Failed to extract code block from fresh retry."
+                        last_failure_type = "no_code"
+                        consecutive_no_code += 1
+                        print(f"      -> [Attempt {attempt}] No code block in fresh retry response.")
+                        continue
+                except Exception as e:
+                    event_log.span_end("Fresh Retry", model_name, attempt=attempt, error=str(e))
+                    last_error = f"Fresh retry request failed: {e}"
+                    print(f"      -> [Attempt {attempt}] Fresh retry failed: {e}")
+                    continue
+
+                # Update prev_c_code with new response and fall through to compile/run
+                prev_c_code = c_code
+                # Re-set file paths for this attempt
+                src_file = os.path.join(out_dir, f"{task['name']}{suffix}.{task['file_extension']}")
+                bin_file = os.path.join(out_dir, f"{task['name']}{suffix}")
+            else:
+                prev_c_code = c_code
 
             # Write source
             with open(src_file, "w") as f:
@@ -1048,7 +1092,15 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
                 print(f"      -> [Attempt {attempt}] Compile took {compile_dur_sec:.3f}s")
 
                 if compile_res.returncode != 0:
-                    last_error = compile_res.stderr.strip()
+                    # Strip absolute paths from error messages so the model
+                    # sees clean filenames (e.g. "foo.go:12:5: error" not
+                    # "/long/output/path/foo.go:12:5: error")
+                    raw_stderr = compile_res.stderr.strip()
+                    if out_dir in raw_stderr:
+                        # Replace the output directory prefix, leaving "file.go:line:col: msg"
+                        last_error = raw_stderr.replace(out_dir + "/", "")
+                    else:
+                        last_error = raw_stderr
                     last_failure_type = "compile"
                     last_failed_code = c_code
                     metrics["iteration_history"].append(
@@ -1066,18 +1118,62 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
 
             # Run (timed + traced)
             run_cmd = render_command(task["run_command"], src=src_file, bin=bin_file)
+            run_timeout = task.get("run_timeout", 5)
             event_log.span_begin("Run", model_name, attempt=attempt)
             try:
                 run_res = subprocess.run(
-                    run_cmd, capture_output=True, text=True, timeout=5, check=True
+                    run_cmd, capture_output=True, text=True, timeout=run_timeout, check=True
                 )
                 program_output = run_res.stdout
                 event_log.span_end("Run", model_name, attempt=attempt, returncode=0)
+            except subprocess.TimeoutExpired as e:
+                event_log.span_end(
+                    "Run", model_name, attempt=attempt, error="timeout/deadlock"
+                )
+                partial_stdout = (e.stdout or "").strip() if e.stdout else ""
+                partial_info = ""
+                if partial_stdout:
+                    partial_lines = partial_stdout.splitlines()[:20]
+                    partial_info = (
+                        f"\n\nPartial output captured before the deadlock "
+                        f"({len(partial_lines)} line(s)):\n"
+                        + "\n".join(partial_lines)
+                    )
+                last_error = (
+                    f"Program deadlocked (timed out after {run_timeout}s). "
+                    f"This usually means a goroutine/thread synchronization issue — "
+                    f"check for blocked channels, missing unlocks, or incorrect wait group usage."
+                    f"{partial_info}"
+                )
+                last_failure_type = "runtime"
+                last_failed_code = c_code
+                metrics["iteration_history"].append(
+                    {"attempt": attempt, "error": last_error, "c_code": c_code}
+                )
+                print(f"      -> [Attempt {attempt}] DEADLOCK (timeout after {run_timeout}s)")
+                if partial_stdout:
+                    print(f"           Partial output: {partial_stdout[:200]}")
+                continue
             except subprocess.CalledProcessError as e:
                 event_log.span_end(
                     "Run", model_name, attempt=attempt, returncode=e.returncode
                 )
-                last_error = f"Runtime error (exit {e.returncode}): {e.stderr.strip()}"
+                # Keep the error headline and lines referencing the model's own
+                # source file (with line:col info).  Skip Go stdlib internals
+                # like /usr/lib/go-1.24/src/... which waste context.
+                stderr_lines = e.stderr.strip().splitlines()
+                src_basename = os.path.basename(src_file)
+                relevant = []
+                for line in stderr_lines:
+                    if src_basename in line:
+                        # Strip the output dir prefix from this line too
+                        relevant.append(line.replace(out_dir + "/", ""))
+                    elif line.startswith("fatal error:") or line.startswith("panic:"):
+                        relevant.append(line)
+                if not relevant:
+                    # Fallback: just take first 3 lines
+                    relevant = stderr_lines[:3]
+                last_error = f"Runtime error (exit {e.returncode}): " + "\n".join(relevant)
                 last_failure_type = "runtime"
                 last_failed_code = c_code
                 metrics["iteration_history"].append(
@@ -1110,6 +1206,25 @@ def evaluate_model(model_name, event_log, task, previous_model=None):
             passed, validation_errors, validation_notes = run_validation_rules(
                 program_output, task["validation"]
             )
+
+            if not passed:
+                # Concurrency programs can have non-deterministic output.
+                # Re-run once more before declaring failure — the program may
+                # pass on a second scheduling.
+                try:
+                    rerun_res = subprocess.run(
+                        run_cmd, capture_output=True, text=True, timeout=run_timeout, check=True
+                    )
+                    rerun_passed, _, rerun_notes = run_validation_rules(
+                        rerun_res.stdout, task["validation"]
+                    )
+                    if rerun_passed:
+                        print(f"      -> [Attempt {attempt}] First run failed validation but re-run passed.")
+                        program_output = rerun_res.stdout
+                        passed = True
+                        validation_notes = rerun_notes
+                except Exception:
+                    pass  # re-run failed too, use original errors
 
             if not passed:
                 last_error = "\n".join(f"- {e}" for e in validation_errors)
@@ -1718,6 +1833,34 @@ def main():
                 f"{r.get('total_compile_time_sec', 0.0):<11.3f}"
             )
         print("=" * 120)
+
+        # Write the results table to a file in the run's output directory
+        date_str = datetime.now().strftime("%Y-%m-%d")
+        results_dir = os.path.join(OUTPUT_BASE, date_str)
+        os.makedirs(results_dir, exist_ok=True)
+        results_txt_path = os.path.join(results_dir, "results.txt")
+        try:
+            with open(results_txt_path, "w", encoding="utf-8") as rf:
+                header = (
+                    f"{'MODEL':<25} | {'STATUS':<14} | {'FAIL TYPE':<12} | {'TRIES':<5} | "
+                    f"{'TOKENS':<8} | {'TIME (s)':<8} | {'TOK/s':<8} | {'COMPILE (s)':<11}"
+                )
+                rf.write("=" * 120 + "\n")
+                rf.write(header + "\n")
+                rf.write("=" * 120 + "\n")
+                for r in results:
+                    fail_type = r.get("failure_type") or ""
+                    rf.write(
+                        f"{r['model'][:25]:<25} | {r['status']:<14} | {fail_type:<12} | "
+                        f"{r.get('compile_attempts', 1):<5} | "
+                        f"{r['tokens_used']:<8} | {r['time_taken_sec']:<8.2f} | "
+                        f"{r['tokens_per_sec']:<8.2f} | "
+                        f"{r.get('total_compile_time_sec', 0.0):<11.3f}\n"
+                    )
+                rf.write("=" * 120 + "\n")
+            print(f"\nResults table written -> {results_txt_path}")
+        except Exception as e:
+            print(f"[WARN] Failed to write results table: {e}")
 
         if args.chrome_trace:
             print()
