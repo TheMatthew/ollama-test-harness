@@ -8,6 +8,7 @@
 
   "build_command": ["go", "build", "-o", "{bin}", "{src}"],
   "run_command": ["{bin}"],
+  "run_timeout": 10,
 
   "validation": [
     { "type": "contains_count", "substring": "produced bread", "expected": 8 },
