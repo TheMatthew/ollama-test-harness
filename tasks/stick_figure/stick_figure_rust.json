@@ -1,0 +1,23 @@
+{
+  "name": "stick_figure_rust",
+  "language": "rust",
+  "file_extension": "rs",
+  "prompt_file": "stick_figure_rust.prompt.md",
+
+  "system_prompt": "You are a careful {language} programmer. Respond only with the requested code, wrapped in a single ```{language} ... ``` block, and no explanation outside the code block.",
+
+  "build_command": ["rustc", "{src}", "-o", "{bin}"],
+  "run_command": ["{bin}"],
+
+  "validation": [
+    { "type": "line_count", "expected": 18 },
+    { "type": "contains_count", "substring": "_____", "expected": 2 },
+    { "type": "contains_count", "substring": "o o", "expected": 1 },
+    { "type": "contains_count", "substring": "-----+-----", "expected": 1 },
+    { "type": "contains_count", "substring": "/|\\", "expected": 2 },
+    { "type": "contains_count", "substring": "___|___", "expected": 1 },
+    { "type": "contains_count", "substring": "=   =", "expected": 1 },
+    { "type": "single_char_at", "line": 6, "index": 10, "char": "|", "label": "Neck" },
+    { "type": "contains_all", "substrings": ["|  >  |", "| \\_/ |"] }
+  ]
+}
